@@ -9,8 +9,8 @@ The analysis focuses on processing transcriptomic datasets, performing different
 ## Objectives
 
 - Perform RNA-seq data preprocessing and quality filtering
-- Identify differentially expressed genes between experimental groups
-- Analyze gene expression patterns associated with CVD and AD
+- Identify differentially expressed genes between different stages of CVD
+- Analyze common gene expression patterns associated with CVD and AD
 - Generate visualizations and downstream biological interpretations
 
 ## Data
@@ -23,15 +23,24 @@ Due to file size limitations and data management considerations, raw datasets ar
 
 - R
 - R Markdown
+- limma/voom Pipeline
 - Differential Expression Analysis (DEA)
-- Gene expression analysis
-- Data visualization
+- Regression Analysis
+- Gene Set Enrichment Analysis (GSEA)
+- Data visualization (MDS, PCA, Volcano plot, heatmap, etc)
 
 Main analysis workflow:
 - Data loading and preprocessing
 - Filtering and normalization
 - Differential expression analysis
+- Pathway Enrichment Analysis
 - Visualization of results
 - Biological interpretation of gene expression changes
 
-## Repository Structure
+## Results
+
+The workflow generates differential expression results and visualization outputs to explore molecular patterns associated with CVD and AD.
+
+## Author
+
+Yixuan Wu
