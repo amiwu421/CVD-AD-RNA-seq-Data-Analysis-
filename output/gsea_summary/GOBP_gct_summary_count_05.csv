@@ -1,0 +1,5 @@
+"phenotype","fdr_threshold","contrast","model","up","down"
+"gct","0.05","ci_num2_gct1","basic",8,7
+"gct","0.05","ci_num2_gct1","lifestyle",9,1
+"gct","0.05","ci_num2_gct1","AD",12,1
+"gct","0.05","ci_num2_gct1","path",14,14

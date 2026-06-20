@@ -1,0 +1,1949 @@
+---
+title: "DEA_Analysis"
+output: html_document
+date: "2025-11-27"
+---
+
+
+```{r setup, message=FALSE, warning=FALSE}
+################################################################################
+# SECTION 1: Data Loading and Preprocessing
+################################################################################
+library(rms)
+library(RColorBrewer)
+library(MASS)
+library(dplyr)
+library(stringr)
+library(UpSetR)
+library(ggthemes)
+library(cowplot)
+library(reshape2)
+library(edgeR)
+library(limma)
+library(BRETIGEA)
+library(naturalsort)
+library(ggplot2)
+library(ggsci)
+library(ggpubr)
+library(ggrepel)
+library(ggbeeswarm)
+library(readr)
+library(SuperExactTest)
+library(ComplexUpset) 
+```
+
+```{r}
+# SECTION 1.1 DATA LOADING
+# read gene expression count matrix
+counts <- read.delim("~/Downloads/ROSMAP_Filtered_counts_(greater_than_1cpm).tsv", check.names = FALSE)
+# head(counts) # sample id (510_120515), can be matched to specimenID
+# counts: rows = genes, columns = samples
+gene_id <- counts[[1]]
+#generate a counts matrix because limma Voom uses numeric matrix
+counts_mat <- as.matrix((counts[, -1]))
+rownames(counts_mat) <- gene_id
+sample_id <- colnames(counts_mat) # remove the first column which is not a sample
+# nrow(counts) #18859
+
+# read quality metrics data file
+gene_metric <- read.table("~/Downloads/qualityMetrics.csv", header = TRUE, sep ="", stringsAsFactors = FALSE)
+# dim(gene_metric) # 1118 23
+# head(gene_metric)
+qc <- gene_metric[, c("Sample", "PCT_RIBOSOMAL_BASES", "PCT_CODING_BASES", "PCT_UTR_BASES", "ESTIMATED_LIBRARY_SIZE", "MEDIAN_CV_COVERAGE", "RinScore", "Batch")]
+
+# read ensembl gene reference information (contains "all_genes" object)
+load("~/Downloads/all_genes_ensembl.RData")
+# head(all_genes)
+
+# read metadata that can bridge the sample_id in gene expression counts with proj_id from phenotype data
+metadata1 <- read.csv("~/Downloads/ROSMAP_clinical.csv")
+# head(metadata1) # has columns representing projid(10101589), individualID(R6939144)
+projid1 <- metadata1$projid
+indiv_id1 <- metadata1$individualID
+
+metadata2 <- read.csv("~/Downloads/ROSMAP_biospecimen_metadata.csv") 
+# head(metadata2) #individualID(R1743384), specimenID (190403-B4-A_R1743384)
+metadata2_dlpfc <- subset(metadata2, tissue == "dorsolateral prefrontal cortex")
+speci_id2 <- metadata2_dlpfc$specimenID
+indiv_id2 <- metadata2_dlpfc$individualID
+# nrow(metadata2) # 13235
+# nrow(metadata2_dlpfc) # 7660
+
+# For each sample ID from the gene count matrix, the row of speci_id2 it appears in
+ind_sample_to_meta2 <- match(sample_id, speci_id2) 
+
+# build a table that links sample_id -> speci_id -> indiv_id
+sample_map <- data.frame(
+  sample_id = sample_id,
+  specimenID = speci_id2[ind_sample_to_meta2],
+  individualID = indiv_id2[ind_sample_to_meta2],
+  stringsAsFactors = FALSE
+)
+
+# drop the sample that didn't match metadata 2 (ind_sample_to_meta2 may contain n/a if not match)
+sample_map <- sample_map[!is.na(sample_map$individualID), ]
+# nrow(sample_map) #1092
+
+# give the index of indiv_id1 that match with indiv_id2
+ind_indiv_to_meta1 <- match(sample_map$individualID, indiv_id1) 
+# add projid to sample_map
+sample_map$projid <- projid1[ind_indiv_to_meta1]
+sample_map <- sample_map[!is.na(sample_map$projid), ]
+sample_map <- merge(
+  sample_map,
+  qc,
+  by.x = "projid",
+  by.y = "Sample",
+  all.x = TRUE
+)
+
+# read phenotype data (include caa_4gp, arteriol_scler, cvda_4gp2, ci_num2_mct, ci_num2_gct)
+sf <- read.csv("~/Downloads/dataset_978_basic_04-21-2023.csv")
+sf1 <- read.csv("~/Downloads/dataset_978_long_04-21-2023.csv")
+# head(sf) # has projid
+pheno_keep <- c("projid", "caa_4gp", "arteriol_scler", "cvda_4gp2", "ci_num2_mct", "ci_num2_gct", "msex", "pmi", "age_death", "apoe_genotype", "ad_reagan", "smoking", "ldai_bl", "educ")
+sf_sub <- sf[, pheno_keep, drop = FALSE] # drop = FALSE ensures that the sample with phenotype not recorded was not removed by filled with NA
+sf1_sub <- sf1[, c("projid", "bmi"), drop = FALSE]
+# create a sample metadata table that only include the ids for matched samples
+sample_meta <- merge(
+  sample_map,
+  sf_sub,
+  by = "projid",
+  all.x = TRUE
+)
+sample_meta <- merge(
+  sample_meta,
+  sf1_sub,
+  by = "projid",
+  all.x = TRUE
+)
+
+# Preprocess covariates
+# apoe_genotype is recorded as {22,23,24,33,34,44} so we need to make it binary for covariate
+sample_meta$APOE_e4_carrier <- ifelse(sample_meta$apoe_genotype %in% c(24, 34, 44), 1,
+                            ifelse(sample_meta$apoe_genotype %in% c(22, 23, 33), 0, NA))
+sample_meta$APOE_e4_carrier <- factor(sample_meta$APOE_e4_carrier, levels = c(0,1))
+# dim(sample_meta) 
+
+# Batch is not recorded as covariates so need to convert to factors
+sample_meta$Batch <- factor(sample_meta$Batch)
+```
+
+```{r}
+# sex, age death (mean, median), educ, pmi, smoking, alcohol, phenotype (stage proportion)
+head(d$samples)
+nrow(d$samples)
+sum(d$samples$ci_num2_mct== "1", na.rm = TRUE)
+length(d$samples)
+mean(d$samples$age_death)
+median(d$samples$age_death)
+```
+
+```{r}
+# SECTION 1.2 DATA PROCESSING
+
+# generate a new count matrix that only include matched samples
+keeped_samples <- intersect(colnames(counts_mat), sample_meta$sample_id)
+counts_mat2 <- counts_mat[, keeped_samples, drop = FALSE] # 1092 patients included
+
+#generate DGEList
+d <- DGEList(counts = counts_mat2)
+d$samples$sample_id <- colnames(d$counts)
+
+# make sure sample_meta rows are in the same order as d samples
+ord <- match(d$samples$sample_id, sample_meta$sample_id)
+d$samples <- cbind(d$samples, sample_meta[ord, , drop = FALSE])
+
+# dim(d) # 18859 1092
+```
+
+```{r}
+### Voom and MDS plot
+options(repr.plot.width = 13, repr.plot.height = 6)
+v0 <- voom(d, plot = TRUE)
+# no need of applying cut off because data is already filtered
+# Voom plot converts your raw counts into log2-counts per million (logCPM) and estimates a mean–variance relationship
+# x-axis: average expression (typically average logCPM)
+# y-axis: the estimated variance (or equivalently the square-root of the variance / SD trend) across genes
+# A fitted trend line showing how variance changes with expression
+
+# visualize MDS
+options(repr.plot.width = 8, repr.plot.height = 8)
+# use the top 5000 most variable genes (top=5000) to compute distances
+plotMDS(d, top = 5000, labels = d$samples$msex) 
+# MDS plot visualizes how similar samples are based on expression profiles
+# Run MDS and capture the coordinates
+```
+
+```{r}
+# SECTION 1.3 PCA plot
+
+# for visualization, estimate cell type proportions in whole sample
+options(repr.plot.width = 10, repr.plot.height = 5)
+
+# First, normalize the gene expresssion for a more reliable cell type proportion estimates
+d_norm <- calcNormFactors(d) # calculate normalization factors
+v_cells <- voom(d_norm, plot = TRUE) # apply voom transformation
+# v_cells is now an EList, v_cells$E is logCPM expression, v_cells$weights is weight for each gene x sample
+
+# Ensure rownames are gene symbols for brainCell()
+gene_ids <- rownames(v_cells$E)
+
+gene_symbols <- all_genes$external_gene_name[match(gene_ids, all_genes$ensembl_gene_id)]
+
+# remove non-recognizable genes
+keep <- !is.na(gene_symbols) & gene_symbols != ""
+v_cells$E <- v_cells$E[keep, , drop = FALSE]
+v_cells$weights <- v_cells$weights[keep, , drop = FALSE]
+
+#update rownaems with gene symbols
+rownames(v_cells$E) <- gene_symbols[keep]
+
+#estimate the cell type proportion based on gene counts (neuron, astrocyte, microglia, oligodendrocyte, OPC, endothelial)
+ctps <- brainCells(v_cells$E, species = "human" , nMarker = 500)
+ctps_df <- as.data.frame(ctps) # deconvolution using BRETIGEA with 500 marker genes
+# Now ctps_df is a data frame where row = sample, column represents the proportion of each cell type
+# Convert this wide format to a long format
+ctps_df$participant <- rownames(ctps_df)
+ctps_melt <- reshape2::melt(ctps_df,id.vars = "participant")
+names(ctps_melt)[2] <- "cell"
+
+#create a bar graph to show cell type proportion
+ggplot(data=ctps_melt, aes(x=participant, y=abs(value), fill=cell))+ geom_bar(position = "fill",stat="identity")
+
+# PCA plot: answer How do samples differ in their cellular composition
+# remove the participant column, leaving only numeric column for PCA plot
+res.pca <- FactoMineR::PCA(ctps_df[, setdiff(names(ctps_df), "participant")])
+options(repr.plot.width = 8, repr.plot.height = 6)
+plot(res.pca, choix = "ind", label = "none")
+# PCA individuals plot: each point = one sample, distance shows cellular composition difference
+
+options(repr.plot.width = 8, repr.plot.height = 8)
+plot(res.pca, choix = "var")
+# PCA Variables plot: tells you which cell types drive each PC.
+# Longer arrow → cell type strongly contributes to variance
+# Cell types pointing in the same direction are positively correlated
+
+```
+
+```{r}
+################################################################################
+# SECTION 2: Regression Analysis
+################################################################################
+### SECTION 2.1 Design Matrix
+
+
+### Function build design matrices
+build_design_matrix <- function(d, pheno_var, pheno_label, save_prefix) {
+  
+  # 1. Subset samples
+  d_ph <- d[, d$samples[[pheno_var]] != "Null" & !is.na(d$samples[[pheno_var]])]
+  n_before_ph <- ncol(d_ph)
+  
+  # 2. make the variables factor
+  d_ph$samples[[pheno_var]] <- factor(d_ph$samples[[pheno_var]])
+  
+  # 3. Model design 
+  design_ph_basic <- model.matrix(
+    as.formula(paste("~ lib.size + RinScore + pmi + Batch + age_death + msex +", pheno_var)),
+    data = d_ph$samples
+  )
+  n_ph_basic <- nrow(design_ph_basic)
+  
+  design_ph_lifestyle <- model.matrix(
+    as.formula(paste("~ lib.size + RinScore + pmi + Batch + age_death + msex + smoking + bmi + ldai_bl + educ +", pheno_var)),
+    data = d_ph$samples
+  )
+  n_ph_lifestyle <- nrow(design_ph_lifestyle)
+  
+  design_ph_AD <- model.matrix(
+    as.formula(paste("~ lib.size + RinScore + pmi + Batch + age_death + msex + ad_reagan + apoe_genotype + smoking + bmi + ldai_bl + educ +", pheno_var)),
+    data = d_ph$samples
+  )
+  n_ph_AD <- nrow(design_ph_AD)
+  
+  design_ph_path <- model.matrix(
+  ~ lib.size + RinScore + pmi + Batch + age_death + msex +
+    ad_reagan + apoe_genotype +
+    smoking + bmi + ldai_bl + educ +
+    caa_4gp + cvda_4gp2 + arteriol_scler + ci_num2_mct + ci_num2_gct,
+  data = d_ph$samples
+)
+  n_ph_path <- nrow(design_ph_path)
+  
+  # 4-8. Subset, droplevels, refit the model with new sample size, calculate normalization factor and voom 
+  keep_samples <- intersect(rownames(design_ph_basic), colnames(d_ph))
+  d_ph_basic <- d_ph[, keep_samples]
+  d_ph_basic$samples$Batch <- droplevels(d_ph_basic$samples$Batch)
+  design_ph_basic <- model.matrix(
+    as.formula(paste("~ lib.size + RinScore + pmi + Batch + age_death + msex +", pheno_var)),
+    data = d_ph_basic$samples
+  )
+  d_ph_basic <- calcNormFactors(d_ph_basic)
+  v_ph_basic <- voom(d_ph_basic, design_ph_basic)
+  
+  keep_samples <- intersect(rownames(design_ph_lifestyle), colnames(d_ph))
+  d_ph_lifestyle <- d_ph[, keep_samples]
+  d_ph_lifestyle$samples$Batch <- droplevels(d_ph_lifestyle$samples$Batch)
+  design_ph_lifestyle <- model.matrix(
+    as.formula(paste("~ lib.size + RinScore + pmi + Batch + age_death + msex + smoking + bmi + ldai_bl + educ +", pheno_var)),
+    data = d_ph_lifestyle$samples
+  )
+  d_ph_lifestyle <- calcNormFactors(d_ph_lifestyle)
+  v_ph_lifestyle <- voom(d_ph_lifestyle, design_ph_lifestyle)
+  
+  keep_samples <- intersect(rownames(design_ph_AD), colnames(d_ph))
+  d_ph_AD <- d_ph[, keep_samples]
+  d_ph_AD$samples$Batch <- droplevels(d_ph_AD$samples$Batch)
+  design_ph_AD <- model.matrix(
+    as.formula(paste("~ lib.size + RinScore + pmi + Batch + age_death + msex + ad_reagan + apoe_genotype + smoking + bmi + ldai_bl + educ +", pheno_var)),
+    data = d_ph_AD$samples
+  )
+  d_ph_AD <- calcNormFactors(d_ph_AD)
+  v_ph_AD <- voom(d_ph_AD, design_ph_AD)
+  
+  keep_samples <- intersect(rownames(design_ph_path), colnames(d_ph))
+  d_ph_path <- d_ph[, keep_samples]
+  d_ph_path$samples$Batch <- droplevels(d_ph_path$samples$Batch)
+  design_ph_path <- model.matrix(
+  ~ lib.size + RinScore + pmi + Batch + age_death + msex +
+    ad_reagan + apoe_genotype +
+    smoking + bmi + ldai_bl + educ +
+    caa_4gp + cvda_4gp2 + arteriol_scler + ci_num2_mct + ci_num2_gct,
+  data = d_ph_path$samples
+)
+
+  d_ph_path <- calcNormFactors(d_ph_path)
+  v_ph_path <- voom(d_ph_path, design_ph_path)
+  
+  # 9. Sample summary 
+  sample_summary_ph <- data.frame(
+    phenotype = rep(pheno_label, 5),
+    model = c("original", "basic", "lifestyle", "AD", "pathologies"),
+    n = c(n_before_ph, n_ph_basic, n_ph_lifestyle, n_ph_AD, n_ph_path)
+  )
+  
+  # Return everything in a list
+  out <- list(
+    d_ph = d_ph,
+    d_ph_basic = d_ph_basic,
+    d_ph_lifestyle = d_ph_lifestyle,
+    d_ph_AD = d_ph_AD,
+    d_ph_path = d_ph_path,
+    
+    v_ph_basic = v_ph_basic,
+    v_ph_lifestyle = v_ph_lifestyle,
+    v_ph_AD = v_ph_AD,
+    v_ph_path = v_ph_path,
+    
+    design_ph_basic = design_ph_basic,
+    design_ph_lifestyle = design_ph_lifestyle,
+    design_ph_AD = design_ph_AD,
+    design_ph_path = design_ph_path,
+    
+    sample_summary_ph = sample_summary_ph
+  )
+  
+  # Save to RDS
+  saveRDS(out, paste0("output/phenotype_objects_", save_prefix, ".rds"))
+  
+  return(out)
+}
+
+caa_design <- build_design_matrix(d, "caa_4gp", "CAA", "caa")
+art_design <- build_design_matrix(d, "arteriol_scler", "ART", "art")
+cvda_design <- build_design_matrix(d, "cvda_4gp2", "CVDA", "cvda")
+gct_design <- build_design_matrix(d, "ci_num2_gct", "GCT", "gct")
+mct_design <- build_design_matrix(d, "ci_num2_mct", "MCT", "mct")
+
+```
+
+```{r}
+### Load design objects
+caa_design <- readRDS("output/phenotype_objects_caa.rds")
+art_design <- readRDS("output/phenotype_objects_art.rds")
+cvda_design <- readRDS("output/phenotype_objects_cvda.rds")
+gct_design <- readRDS("output/phenotype_objects_gct.rds")
+mct_design <- readRDS("output/phenotype_objects_mct.rds")
+```
+
+
+```{r}
+### SECTION 2.2 Limma/voom Pipeline
+
+## Helper function 
+cell_correct_voom <- function(v_obj, all_genes) {
+  v_obj_cells <- v_obj
+  original_ensembl <- rownames(v_obj_cells$E)
+  genesymbols <- all_genes$external_gene_name[match(rownames(v_obj_cells$E), all_genes$ensembl_gene_id)]
+  rownames(v_obj_cells$E) <- genesymbols
+  keep <- !is.na(genesymbols)
+  E_keep <- v_obj_cells$E[keep, , drop = FALSE]
+  W_keep <- v_obj_cells$weights[keep, , drop = FALSE]
+  ens_keep <- original_ensembl[keep]
+  
+  adj <- adjustBrainCells(E_keep, species = "human", verbose = FALSE)
+  
+  v_obj_cells$E <- adj$expression
+  v_obj_cells$weights <- W_keep
+  rownames(v_obj_cells$E) <- ens_keep
+  
+  return (v_obj_cells)
+}
+
+# Helper Function
+make_toptable <- function(eb, design, d_sub, pheno_name, all_genes) {
+  coef_names <- colnames(design)
+  pheno_coefs <- coef_names[grepl(paste0("^", pheno_name), coef_names)]
+
+  res_list <- list()
+
+  for (coef in pheno_coefs) {
+    tt <- topTable(eb,
+                   coef = coef,
+                   number = Inf, # include all genes not just top 10
+                   sort.by = "p" # sort by p value with the smallest on top
+    )
+
+    # standard error
+    tt$se <- eb$stdev.unscaled[, coef] * sqrt(eb$s2.post)
+
+    # metadata
+    tt$n <- nrow(d_sub$samples)
+    tt$gene <- rownames(tt)
+
+    # annotations
+    ind <- match(tt$gene, all_genes$ensembl_gene_id)
+    tt$hugo <- all_genes$external_gene_name[ind]
+    tt$chr <- all_genes$chromosome_name[ind]
+    tt$pos <- all_genes$start_position[ind]
+
+    res_list[[coef]] <- tt
+  }
+
+  return(res_list)
+}
+
+### main function for modeling fitting
+run_DE_models <- function(results, pheno_name, save_prefix, all_genes) {
+  
+  # BASIC MODEL
+  v_use_basic <- cell_correct_voom(results$v_ph_basic, all_genes)
+  fit_basic   <- lmFit(v_use_basic, results$design_ph_basic, method = "robust", maxit = 20000)
+  eb_basic    <- eBayes(fit_basic, robust = TRUE)
+  
+  ttlist_basic <- make_toptable(
+    eb         = eb_basic,
+    design     = results$design_ph_basic,
+    d_sub      = results$d_ph_basic,
+    pheno_name = pheno_name,
+    all_genes  = all_genes
+  )
+  
+  tt_all_basic <- NULL
+  for (nm in names(ttlist_basic)) {
+    tt_one <- ttlist_basic[[nm]]
+    
+    if (is.null(tt_all_basic)) {
+      names(tt_one)[1:8] <- paste0(names(tt_one)[1:8], "_", nm)
+      tt_all_basic <- tt_one
+    } else {
+      tt_one <- tt_one %>%
+        dplyr::select(gene, logFC, AveExpr, t, P.Value, adj.P.Val, B) %>%
+        dplyr::rename_with(~paste0(.x, "_", nm), -gene)
+      tt_all_basic <- merge(tt_all_basic, tt_one, by = "gene", all = TRUE)
+    }
+  }
+  
+  # LIFESTYLE MODEL
+  v_use_lifestyle <- cell_correct_voom(results$v_ph_lifestyle, all_genes)
+  fit_lifestyle   <- lmFit(v_use_lifestyle, results$design_ph_lifestyle, method = "robust", maxit = 20000)
+  eb_lifestyle    <- eBayes(fit_lifestyle, robust = TRUE)
+  
+  ttlist_lifestyle <- make_toptable(
+    eb         = eb_lifestyle,
+    design     = results$design_ph_lifestyle,
+    d_sub      = results$d_ph_lifestyle,
+    pheno_name = pheno_name,
+    all_genes  = all_genes
+  )
+  
+  tt_all_lifestyle <- NULL
+  for (nm in names(ttlist_lifestyle)) {
+    tt_one <- ttlist_lifestyle[[nm]]
+    
+    if (is.null(tt_all_lifestyle)) {
+      names(tt_one)[1:8] <- paste0(names(tt_one)[1:8], "_", nm)
+      tt_all_lifestyle <- tt_one
+    } else {
+      tt_one <- tt_one %>%
+        dplyr::select(gene, logFC, AveExpr, t, P.Value, adj.P.Val, B) %>%
+        dplyr::rename_with(~paste0(.x, "_", nm), -gene)
+      tt_all_lifestyle <- merge(tt_all_lifestyle, tt_one, by = "gene", all = TRUE)
+    }
+  }
+  
+  # AD MODEL
+  v_use_AD <- cell_correct_voom(results$v_ph_AD, all_genes)
+  fit_AD   <- lmFit(v_use_AD, results$design_ph_AD, method = "robust", maxit = 20000)
+  eb_AD    <- eBayes(fit_AD, robust = TRUE)
+  
+  ttlist_AD <- make_toptable(
+    eb         = eb_AD,
+    design     = results$design_ph_AD,
+    d_sub      = results$d_ph_AD,
+    pheno_name = pheno_name,
+    all_genes  = all_genes
+  )
+  
+  tt_all_AD <- NULL
+  for (nm in names(ttlist_AD)) {
+    tt_one <- ttlist_AD[[nm]]
+    
+    if (is.null(tt_all_AD)) {
+      names(tt_one)[1:8] <- paste0(names(tt_one)[1:8], "_", nm)
+      tt_all_AD <- tt_one
+    } else {
+      tt_one <- tt_one %>%
+        dplyr::select(gene, logFC, AveExpr, t, P.Value, adj.P.Val, B) %>%
+        dplyr::rename_with(~paste0(.x, "_", nm), -gene)
+      tt_all_AD <- merge(tt_all_AD, tt_one, by = "gene", all = TRUE)
+    }
+  }
+  
+  # PATH MODEL
+  v_use_path <- cell_correct_voom(results$v_ph_path, all_genes)
+  fit_path   <- lmFit(v_use_path, results$design_ph_path, method = "robust", maxit = 20000)
+  eb_path    <- eBayes(fit_path, robust = TRUE)
+  
+  ttlist_path <- make_toptable(
+    eb         = eb_path,
+    design     = results$design_ph_path,
+    d_sub      = results$d_ph_path,
+    pheno_name = pheno_name,
+    all_genes  = all_genes
+  )
+  
+  tt_all_path <- NULL
+  for (nm in names(ttlist_path)) {
+    tt_one <- ttlist_path[[nm]]
+    
+    if (is.null(tt_all_path)) {
+      names(tt_one)[1:8] <- paste0(names(tt_one)[1:8], "_", nm)
+      tt_all_path <- tt_one
+    } else {
+      tt_one <- tt_one %>%
+        dplyr::select(gene, logFC, AveExpr, t, P.Value, adj.P.Val, B) %>%
+        dplyr::rename_with(~paste0(.x, "_", nm), -gene)
+      tt_all_path <- merge(tt_all_path, tt_one, by = "gene", all = TRUE)
+    }
+  }
+  
+  # COMBINE ALL MODELS INTO ONE LIST
+  out <- list(
+    basic     = tt_all_basic,
+    lifestyle = tt_all_lifestyle,
+    AD        = tt_all_AD,
+    path      = tt_all_path
+  )
+  
+  # Save ONE RDS file
+  saveRDS(out, paste0("output/5_pheno/tt_all_", save_prefix, ".rds"))
+  
+  return(out)
+}
+
+
+tt_all_caa <- run_DE_models(caa_design, "caa_4gp", "caa", all_genes)
+tt_all_art <- run_DE_models(art_design, "arteriol_scler", "art", all_genes)
+tt_all_cvda <- run_DE_models(cvda_design, "cvda_4gp2", "cvda", all_genes)
+tt_all_gct <- run_DE_models(gct_design, "ci_num2_gct", "gct", all_genes)
+tt_all_mct <- run_DE_models(mct_design, "ci_num2_mct", "mct", all_genes)
+
+```
+
+```{r}
+### Load tt_all objects
+tt_all_caa <- readRDS("output/5_pheno/tt_all_caa.rds")
+tt_all_art <- readRDS("output/5_pheno/tt_all_art.rds")
+tt_all_cvda <- readRDS("output/5_pheno/tt_all_cvda.rds")
+tt_all_gct <- readRDS("output/5_pheno/tt_all_gct.rds")
+tt_all_mct <- readRDS("output/5_pheno/tt_all_mct.rds")
+```
+
+```{r}
+################################################################################
+# SECTION 3: DEG Analysis
+##############################################################################
+### Section 3.1 Summary Table 
+
+# helper: extract the lists of fdr genes for all contrasts 
+extract_deg_lists <- function(tt, pheno_name, fdr, contrasts) {
+  out <- vector("list", length(contrasts))
+  names(out) <- contrasts
+  
+  for (cid in contrasts) {
+    colname <- paste0("adj.P.Val_", pheno_name, cid)
+    if (!colname %in% colnames(tt)) {
+      out[[cid]] <- character(0)
+      message("did not find that column name for contrast: ", cid)
+    } else {
+      out[[cid]] <- tt[tt[[colname]] < fdr, "hugo"]
+    }
+  }
+  out
+}
+
+summarize_DEGs <- function(tt_all, pheno_name, pheno_label, save_prefix) {
+  
+  # detect contrasts dynamically
+  basic_cols <- colnames(tt_all$basic)
+  adj_cols   <- grep(paste0("^adj.P.Val_", pheno_name), basic_cols, value = TRUE)
+  
+  # extract contrast IDs (e.g., "1", "2", "3")
+  contrasts <- sub(paste0("adj.P.Val_", pheno_name), "", adj_cols)
+
+  # extract DEG lists for each model and FDR
+  basic_05     <- extract_deg_lists(tt_all$basic,     pheno_name, 0.05, contrasts)
+  lifestyle_05 <- extract_deg_lists(tt_all$lifestyle, pheno_name, 0.05, contrasts)
+  AD_05        <- extract_deg_lists(tt_all$AD,        pheno_name, 0.05, contrasts)
+  path_05      <- extract_deg_lists(tt_all$path,      pheno_name, 0.05, contrasts)
+  
+  basic_10     <- extract_deg_lists(tt_all$basic,     pheno_name, 0.10, contrasts)
+  lifestyle_10 <- extract_deg_lists(tt_all$lifestyle, pheno_name, 0.10, contrasts)
+  AD_10        <- extract_deg_lists(tt_all$AD,        pheno_name, 0.10, contrasts)
+  path_10      <- extract_deg_lists(tt_all$path,      pheno_name, 0.10, contrasts)
+  
+  
+  # count tables
+  count_05 <- data.frame(
+    Phenotype = pheno_label,
+    fdr_threshold = "0.05",
+    Contrast = contrasts,
+    Basic_N     = sapply(basic_05,     length),
+    Lifestyle_N = sapply(lifestyle_05, length),
+    AD_N        = sapply(AD_05,        length),
+    Path_N      = sapply(path_05,      length),
+    stringsAsFactors = FALSE
+  )
+  
+  count_10 <- data.frame(
+    Phenotype = pheno_label,
+    fdr_threshold = "0.10",
+    Contrast = contrasts,
+    Basic_N     = sapply(basic_10,     length),
+    Lifestyle_N = sapply(lifestyle_10, length),
+    AD_N        = sapply(AD_10,        length),
+    Path_N      = sapply(path_10,      length),
+    stringsAsFactors = FALSE
+  )
+  
+  # gene tables
+  genes_05 <- data.frame(
+    phenotype = pheno_label,
+    fdr_threshold = "0.05",
+    contrast = contrasts,
+    basic     = sapply(basic_05,     function(x) paste(x, collapse = ",")),
+    lifestyle = sapply(lifestyle_05, function(x) paste(x, collapse = ",")),
+    AD        = sapply(AD_05,        function(x) paste(x, collapse = ",")),
+    path      = sapply(path_05,      function(x) paste(x, collapse = ",")),
+    stringsAsFactors = FALSE
+  )
+  
+  genes_10 <- data.frame(
+    phenotype = pheno_label,
+    fdr_threshold = "0.10",
+    contrast = contrasts,
+    basic     = sapply(basic_10,     function(x) paste(x, collapse = ",")),
+    lifestyle = sapply(lifestyle_10, function(x) paste(x, collapse = ",")),
+    AD        = sapply(AD_10,        function(x) paste(x, collapse = ",")),
+    path      = sapply(path_10,      function(x) paste(x, collapse = ",")),
+    stringsAsFactors = FALSE
+  )
+  
+  # combine into one list
+  out <- list(
+    count_05 = count_05,
+    count_10 = count_10,
+    genes_05 = genes_05,
+    genes_10 = genes_10
+  )
+  
+  # save to RDS
+  saveRDS(out, paste0("output/5_pheno/deg_summary_", save_prefix, ".rds"))
+  
+  return(out)
+}
+
+caa_summary <- summarize_DEGs(tt_all_caa, "caa_4gp", "caa", "caa")
+# Result: 
+# caa_summary$count_05   # DEG counts at FDR 0.05
+# caa_summary$genes_05   # DEG gene lists at FDR 0.05
+
+art_summary  <- summarize_DEGs(tt_all_art,  "arteriol_scler", "art",  "art")
+cvda_summary <- summarize_DEGs(tt_all_cvda, "cvda_4gp2",      "cvda", "cvda")
+gct_summary  <- summarize_DEGs(tt_all_gct,  "ci_num2_gct",    "gct",  "gct")
+mct_summary  <- summarize_DEGs(tt_all_mct,  "ci_num2_mct",    "mct",  "mct")
+
+
+# Build FDR gene tables (0.05 and 0.10) from summary 
+fdrgene_table <- rbind(
+  caa_summary$genes_05,
+  caa_summary$genes_10,
+  art_summary$genes_05,
+  art_summary$genes_10,
+  cvda_summary$genes_05,
+  cvda_summary$genes_10,
+  gct_summary$genes_05,
+  gct_summary$genes_10,
+  mct_summary$genes_05,
+  mct_summary$genes_10
+)
+
+write.csv(fdrgene_table, "output/all_fdrgene_tables.csv", row.names = FALSE)
+fdrgene_table
+
+# Build FDR count tables (0.05 and 0.10) from summary  
+
+fdrgene_count_table <- rbind(
+  caa_summary$count_05,
+  caa_summary$count_10,
+  art_summary$count_05,
+  art_summary$count_10,
+  cvda_summary$count_05,
+  cvda_summary$count_10,
+  gct_summary$count_05,
+  gct_summary$count_10,
+  mct_summary$count_05,
+  mct_summary$count_10
+)
+
+write.csv(fdrgene_count_table, "output/fdrgene_count_table.csv", row.names = FALSE)
+fdrgene_count_table
+
+```
+
+
+```{r}
+### Load summary object
+caa_summary <- readRDS("output/5_pheno/deg_summary_caa.rds")
+art_summary <- readRDS("output/5_pheno/deg_summary_art.rds")
+cvda_summary <- readRDS("output/5_pheno/deg_summary_cvda.rds")
+gct_summary <- readRDS("output/5_pheno/deg_summary_gct.rds")
+mct_summary <- readRDS("output/5_pheno/deg_summary_mct.rds")
+```
+
+```{r}
+## -----------------------------------------------------------------------------
+## SECTION 3.2 Stages overlap analysis
+## ----------------------------------------------------------------------------
+### Visualize overlapped genes across different contrasts in the same model
+
+# Helpers
+filter_nonempty <- function(gene_list) {
+  gene_list[sapply(gene_list, function(x) length(x) > 0)]
+}
+get_nonempty_contrasts <- function(fdr_list, model, pheno) {
+  raw <- fdr_list[[model]][[pheno]]
+  filter_nonempty(raw)
+}
+extract_overlap_genes <- function(gene_list) {
+  set_names <- names(gene_list)
+  results <- list()
+  
+  # all combinations of 2 or more sets
+  for (k in 2:length(gene_list)) {
+    combs <- combn(set_names, k, simplify = FALSE)
+    
+    for (cmb in combs) {
+      overlap <- Reduce(intersect, gene_list[cmb])
+      
+      results[[paste(cmb, collapse = " & ")]] <- overlap
+    }
+  }
+  
+  # convert to data frame
+  overlap_df <- do.call(rbind, lapply(names(results), function(nm) {
+    genes <- results[[nm]]
+    if (length(genes) == 0) return(NULL)
+    
+    data.frame(
+      intersection = nm,
+      n_genes = length(genes),
+      genes = paste(genes, collapse = ", "),
+      stringsAsFactors = FALSE
+    )
+  }))
+  
+  return(overlap_df)
+}
+run_overlap_analysis <- function(gene_list, title = NULL) {
+  st <- SuperExactTest::supertest(gene_list)
+  print(summary(st))
+  
+  input_matrix <- fromList(gene_list)
+  if (!is.null(title)) {
+    print(UpSetR::upset(
+      input_matrix,
+      main.bar.color = "steelblue",
+      sets.bar.color = "grey40",
+      mainbar.y.label = title,
+      sets.x.label = "Set size",
+      text.scale = 1.5
+    ))
+  } else {
+    print(UpSetR::upset(input_matrix))
+  }
+  
+  overlap_df <- extract_overlap_genes(gene_list)
+  
+  invisible(list(
+    supertest = st,
+    upset_matrix = input_matrix,
+    overlap_table = overlap_df
+  ))
+}
+
+run_all_overlap_analyses <- function(fdr_list, title_prefix = "FDR Analysis") {
+  models <- names(fdr_list)   # basic, lifestyle, AD, path
+  phenos <- names(fdr_list[[1]])  
+  
+  results <- list()
+  
+  for (m in models) {
+    for (ph in phenos) {
+      message("Processing model: ", m, " | phenotype: ", ph)
+      
+      gene_sets <- get_nonempty_contrasts(fdr_list, m, ph)
+      
+      if (length(gene_sets) < 2) {
+        message("  Skipping — fewer than 2 non-empty contrasts.")
+        next
+      }
+      
+      title <- paste0(title_prefix, ": ", m, " | ", ph)
+      results[[m]][[ph]] <- run_overlap_analysis(gene_sets, title = title)
+    }
+  }
+  
+  results
+}
+
+build_fdr_list_from_summary <- function(summary_genes, pheno_label) {
+  models <- c("basic", "lifestyle", "AD", "path")
+  contrasts <- summary_genes$contrast
+  
+  fdr_list <- list()
+  
+  for (m in models) {
+    fdr_list[[m]] <- list()
+    fdr_list[[m]][[pheno_label]] <- list()
+    
+    for (i in seq_along(contrasts)) {
+      cid <- contrasts[i]
+      gene_string <- summary_genes[[m]][i]
+      
+      if (is.na(gene_string) || gene_string == "") {
+        genes <- character(0)
+      } else {
+        genes <- unlist(strsplit(gene_string, ","))
+        genes <- trimws(genes)
+      }
+      fdr_list[[m]][[pheno_label]][[cid]] <- genes
+    }
+  }
+  
+  return(fdr_list)
+}
+
+## Function that compares the overlaps between stages within the same model
+run_overlap_pipeline <- function(summary_obj, pheno_label, fdr = 0.05, outdir = "output/overlap_between_stages") {
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  summary_genes <- if (fdr == 0.05) summary_obj$genes_05 else summary_obj$genes_10
+  
+  fdr_list <- build_fdr_list_from_summary(summary_genes, pheno_label)
+  
+  results <- list()
+  models <- names(fdr_list)
+  
+  for (m in models) {
+    gene_sets <- get_nonempty_contrasts(fdr_list, m, pheno_label)
+    
+    if (length(gene_sets) < 2) {
+      message("Skipping ", m, " — fewer than 2 non-empty contrasts.")
+      next
+    }
+    
+    title <- paste0("FDR <", fdr, ": ", pheno_label, " | ", m)
+    
+    plotfile <- file.path(outdir, paste0("stage_overlap_", pheno_label, "_", m, "_fdr", fdr, ".png"))
+    csvfile  <- file.path(outdir, paste0("stage_overlap_", pheno_label, "_", m, "_fdr", fdr, "_genes.csv"))
+    
+    png(plotfile, width = 1600, height = 1200, res = 200)
+    res <- run_overlap_analysis(gene_sets, title = title)
+    dev.off()
+    
+    if (!is.null(res$overlap_table) && nrow(res$overlap_table) > 0) {
+      write.csv(res$overlap_table, csvfile, row.names = FALSE)
+    }
+    
+    results[[m]] <- res
+  }
+  
+  return(results)
+}
+overlap_caa_05 <- run_overlap_pipeline(caa_summary, "Cerebral Amyloid Angiopathy", 0.05)
+overlap_art_05 <- run_overlap_pipeline(art_summary, "Arteriolosclerosis", 0.05)
+overlap_cvda_05 <- run_overlap_pipeline(cvda_summary, "Cerebral Atherosclerosis", 0.05)
+# gct and mct are skipped because of too few genes
+```
+
+```{r}
+## -----------------------------------------------------------------------------
+## SECTION 3.3 Models overlap analysis
+## ----------------------------------------------------------------------------
+### Section 3.3.1 Visualize the overlap between models within the same phenotype stage
+
+# helper: get non-empty models for a given contrast and phenotype
+get_nonempty_models <- function(fdr_list, pheno_label, contrast) {
+  models <- names(fdr_list)
+  gene_sets <- lapply(models, function(m) fdr_list[[m]][[pheno_label]][[contrast]])
+  names(gene_sets) <- models
+  # drop empty sets
+  gene_sets[sapply(gene_sets, function(x) length(x) > 0)]
+}
+
+# Main function: overlap between models at the same contrast
+run_model_overlap_pipeline <- function(summary_obj,
+                                       pheno_label,
+                                       fdr    = 0.05,
+                                       outdir = "output/overlap_between_models") {
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  # 1) pick correct summary table
+  summary_genes <- if (fdr == 0.05) summary_obj$genes_05 else summary_obj$genes_10
+  
+  # 2) build fdr_list
+  fdr_list <- build_fdr_list_from_summary(summary_genes, pheno_label)
+  
+  # 3) loop over contrasts (same outer loop as contrast pipeline)
+  contrasts <- summary_genes$contrast
+  results   <- list()
+  
+  for (cid in contrasts) {
+    gene_sets <- get_nonempty_models(fdr_list, pheno_label, cid)
+    if (length(gene_sets) < 2) {
+      message("Skipping contrast ", cid, " — fewer than 2 non-empty models.")
+      next
+    }
+    title   <- paste0("FDR <", fdr, ": ", pheno_label, " | contrast ", cid)
+    outfile <- file.path(outdir,
+                         paste0("model_overlap_", pheno_label, "_", cid, "_fdr", fdr, ".png"))
+    csvfile  <- file.path(outdir, paste0("model_overlap_", pheno_label, "_", cid, "_fdr", fdr, "_genes.csv"))
+    
+    png(outfile, width = 1600, height = 1200, res = 200)
+    results[[cid]] <- run_overlap_analysis(gene_sets, title = title)
+    dev.off()
+    
+    if (!is.null(results[[cid]]$overlap_table) && nrow(results[[cid]]$overlap_table) > 0) {
+      write.csv(results[[cid]]$overlap_table, csvfile, row.names = FALSE)
+    }
+  }
+  return(results)
+}
+
+model_overlap_caa_05 <- run_model_overlap_pipeline(caa_summary, "Cerebral Amyloid Angiopathy", 0.05)
+model_overlap_art_05  <- run_model_overlap_pipeline(art_summary,  "Arteriolosclerosis",  0.05)
+model_overlap_cvda_05 <- run_model_overlap_pipeline(cvda_summary, "Cerebral Atherosclerosis", 0.05)
+# Skipped for gct and mct because too few fdr genes
+```
+
+
+```{r}
+### Section 3.3.2 Visualize overlaps across all phenotype at the same stage for the same model
+get_all_genes_for_pheno <- function(summary_pheno, pheno_name) {
+  
+  # Extract FDR < 0.05 gene tables
+  genes_05 <- summary_pheno$genes_05
+  
+  # Build fdr_list
+  fdr_list <- build_fdr_list_from_summary(genes_05, pheno_name)
+  
+  models <- names(fdr_list)
+  
+  # Collect ALL genes across all models and all stages
+  all_genes <- c()
+  
+  for (m in models) {
+    stages <- names(fdr_list[[m]][[pheno_name]])
+    
+    for (s in stages) {
+      gene_vec <- fdr_list[[m]][[pheno_name]][[s]]
+      all_genes <- c(all_genes, gene_vec)
+    }
+  }
+  
+  # Return unique genes
+  unique(all_genes)
+}
+
+run_cross_pheno_union <- function(summary_caa,
+                                  summary_cvda,
+                                  summary_art,
+                                  summary_gct,
+                                  summary_mct,
+                                  outdir = "output/overlap_between_phenotypes_union") {
+  
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Get all DE genes per phenotype
+  caa_all  <- get_all_genes_for_pheno(summary_caa,  "caa")
+  cvda_all <- get_all_genes_for_pheno(summary_cvda, "cvda")
+  art_all  <- get_all_genes_for_pheno(summary_art,  "art")
+  gct_all <-  get_all_genes_for_pheno(summary_gct,  "gct")
+  mct_all <-  get_all_genes_for_pheno(summary_mct,  "mct")
+  
+  gene_sets <- list(
+    Cerebral_Amyloid_Angiopathy  = caa_all,
+    Cerebral_Atherosclerosis = cvda_all,
+    Arteriolosclerosis  = art_all,
+    GCT = gct_all,
+    MCT = mct_all
+  )
+  
+  # Remove empty sets
+  gene_sets <- gene_sets[sapply(gene_sets, length) > 0]
+  
+  outfile <- file.path(outdir, "cross_pheno_union_fdr05.png")
+  csvfile  <- file.path(outdir, "phenotype_overlap_genes.csv")
+  
+  png(outfile, width = 1600, height = 1200, res = 200)
+  result <- run_overlap_analysis(gene_sets,
+                                 title = "Cross-Phenotype Overlap (All DE Genes)")
+  dev.off()
+  
+  if (!is.null(result$overlap_table) && nrow(result$overlap_table) > 0) {
+      write.csv(result$overlap_table, csvfile, row.names = FALSE)
+    }
+  return(result)
+}
+run_cross_pheno_union(
+  summary_caa  = caa_summary,
+  summary_cvda = cvda_summary,
+  summary_art  = art_summary,
+  summary_gct = gct_summary,
+  summary_mct = mct_summary
+)
+
+# 
+# run_cross_pheno_overlap <- function(summary_caa,
+#                                     summary_cvda,
+#                                     summary_art,
+#                                     model,
+#                                     stage_index,
+#                                     outdir = "output/overlap_between_phenotypes") {
+#   
+#   dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+#   
+#   # ---- 1. Extract FDR 0.05 gene tables ----
+#   caa_genes  <- summary_caa$genes_05
+#   cvda_genes <- summary_cvda$genes_05
+#   art_genes  <- summary_art$genes_05
+#   
+#   # ---- 2. Build fdr_list for each phenotype ----
+#   fdr_caa  <- build_fdr_list_from_summary(caa_genes,  "caa")
+#   fdr_cvda <- build_fdr_list_from_summary(cvda_genes, "cvda")
+#   fdr_art  <- build_fdr_list_from_summary(art_genes,  "art")
+#   
+#   # ---- 3. Extract gene sets for the same model + stage ----
+#   stage_key <- as.character(stage_index)
+#   
+#   caa_set  <- fdr_caa[[model]][["caa"]][[stage_key]]
+#   cvda_set <- fdr_cvda[[model]][["cvda"]][[stage_key]]
+#   art_set  <- fdr_art[[model]][["art"]][[stage_key]]
+#   
+#   # ---- 4. Build list for overlap ----
+#   gene_sets <- list(
+#     CAA  = caa_set,
+#     CVDA = cvda_set,
+#     ART  = art_set
+#   )
+#   
+#   # Remove empty sets
+#   gene_sets <- gene_sets[sapply(gene_sets, length) > 0]
+#   
+#   if (length(gene_sets) < 2) {
+#     message("Skipping: fewer than 2 phenotypes have DEGs for model ", model,
+#             " stage ", stage_index)
+#     return(NULL)
+#   }
+#   
+#   # ---- 5. Save plot ----
+#   title <- paste0("Cross-Phenotype Overlap | Model: ", model,
+#                   " | Stage: ", stage_index, " | FDR < 0.05")
+#   
+#   outfile <- file.path(
+#     outdir,
+#     paste0("cross_pheno_overlap_", model, "_stage", stage_index, "_fdr05.png")
+#   )
+#   
+#   png(outfile, width = 1600, height = 1200, res = 200)
+#   result <- run_overlap_analysis(gene_sets, title = title)
+#   dev.off()
+#   
+#   return(result)
+# }
+# 
+# models <- c("basic", "lifestyle", "AD", "path")
+# stages <- 1:3
+# 
+# for (m in models) {
+#   for (s in stages) {
+#     message("Running cross-phenotype overlap: model = ", m, ", stage = ", s)
+#     
+#     run_cross_pheno_overlap(
+#       summary_caa = caa_summary,
+#       summary_cvda = cvda_summary,
+#       summary_art = art_summary,
+#       model = m,
+#       stage_index = s
+#     )
+#   }
+# }
+```
+
+```{r}
+## -----------------------------------------------------------------------------
+## SECTION 3.4.2 Volcano plots
+## ----------------------------------------------------------------------------- 
+
+# helper function: create the volcano plot for all stages of all phenotype, label DEG (fdr < 0.05) in red
+pheno_fullname <- c(
+  art  = "Arteriolosclerosis",
+  caa  = "Cerebral Amyloid Angiopathy",
+  cvda = "Cerebral Atherosclerosis",
+  gct  = "Gross Infarctions",
+  mct  = "Micro Infarctions"
+)
+create_volcano <- function(tt_model, contrast_name, plot_title) {
+  
+  p_col   <- paste0("P.Value_", contrast_name)
+  fc_col  <- paste0("logFC_", contrast_name)
+  adj_col <- paste0("adj.P.Val_", contrast_name)
+  
+  missing <- setdiff(c(p_col, fc_col, adj_col), colnames(tt_model))
+  if (length(missing) > 0) {
+    message("Skipping ", contrast_name, " — missing columns: ", paste(missing, collapse = ", "))
+    return(NULL)
+  }
+  
+  topten <- tt_model$hugo[order(tt_model[[adj_col]])][1:10]
+  
+  ggplot(tt_model, aes(x = .data[[fc_col]], y = -log10(.data[[p_col]]))) +
+    geom_point(aes(color = .data[[adj_col]] < 0.05)) +
+    geom_text_repel(
+      data = subset(tt_model, hugo %in% topten),
+      aes(label = hugo),
+      fontface = "italic"
+    ) +
+    scale_color_manual(values = c("grey60", "red")) +
+    labs(
+      title = plot_title,
+      x = "Log2 Fold Change",
+      y = "-Log10(P-value)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+
+# 1. List of all tt_all objects (one per phenotype)
+tt_all_list <- list(
+  art  = tt_all_art,
+  caa  = tt_all_caa,
+  cvda = tt_all_cvda,
+  gct  = tt_all_gct,
+  mct  = tt_all_mct
+)
+
+# 2. For each phenotype, define the contrasts to plot
+pheno_contrasts <- list(
+  art  = c("arteriol_scler1", "arteriol_scler2", "arteriol_scler3"),
+  caa  = c("caa_4gp1",        "caa_4gp2",        "caa_4gp3"),
+  cvda = c("cvda_4gp21",      "cvda_4gp22",      "cvda_4gp23"),
+  gct  = c("ci_num2_gct1"),
+  mct  = c("ci_num2_mct1")
+)
+
+# 3. Create output folder
+dir.create("output/volcano", showWarnings = FALSE, recursive = TRUE)
+
+# 4. Loop over phenotypes → models → contrasts
+for (pheno in names(tt_all_list)) {
+  
+  message("Processing phenotype: ", pheno)
+  
+  tt_all <- tt_all_list[[pheno]]
+  contrasts <- pheno_contrasts[[pheno]]
+  models <- names(tt_all)
+  
+  for (coef in contrasts) {
+    message("  Contrast: ", coef)
+    
+    for (m in models) {
+      tt_model <- tt_all[[m]]
+      if (is.null(tt_model)) next
+      
+      # Build title: Phenotype full name + model
+      contrast_num <- substr(coef, nchar(coef), nchar(coef))
+      plot_title <- paste0(pheno_fullname[[pheno]], " – ", m, " – contrast: ", contrast_num)
+      
+      p <- create_volcano(tt_model, coef, plot_title)
+      if (is.null(p)) next
+      
+      outfile <- paste0("output/volcano/", pheno, "_", m, "_", coef, ".png")
+      ggsave(outfile, p, width = 6, height = 5)
+    }
+  }
+}
+
+```
+
+```{r}
+### Boxplot of specific genes
+gene <-  tt_all_caa_basic[tt_all_caa_basic$adj.P.Val_caa_4gp3 < 0.05, "gene"] # This is the downregulated gene that has fdr < 0.05 at caa_4gp3 across four models
+expr_df <- data.frame(
+  expression = v_use_caa_basic$E[gene, ],
+  stage = d_caa$samples$caa_4gp,
+  sample = rownames(d_caa$samples)
+)
+
+ggplot(expr_df, aes(x = stage, y = expression, fill = stage)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  theme_bw() +
+  ggtitle(paste("Expression of", gene, "across four model at caa_4gp3")) +
+  ylab("logCPM (voom)") +
+  xlab("CAA stage")
+
+```
+
+
+```{r}
+## -----------------------------------------------------------------------------
+## SECTION 3.6 GSEA
+## -----------------------------------------------------------------------------
+library(rms)
+library(reshape2)
+library(stringr)
+library(ggsci)
+library(gplots)
+library(ggrepel)
+library(ggthemes)
+library(ggpubr)
+library(ggsci)
+library(gridExtra)
+library(data.table)
+library(org.Hs.eg.db)
+library(gprofiler2)
+library(rrvgo)
+library(ggplot2)
+library(GGally)
+library(network)
+library(sna)
+library(ggnetwork)
+library(ggraph)
+library(clusterProfiler)
+library(DOSE)
+library(AnnotationDbi)
+library(enrichplot)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(GO.db)
+library(dplyr)
+library(fgsea)
+
+```
+
+```{r}
+### Section 3.6.1 Data Loading 
+# Load all tt_all objects produced by run_DE_models()
+
+tt_all_caa  <- readRDS("~/Documents/BCB330/output/5_pheno/tt_all_caa.rds")
+tt_all_art  <- readRDS("~/Documents/BCB330/output/5_pheno/tt_all_art.rds")
+tt_all_cvda <- readRDS("~/Documents/BCB330/output/5_pheno/tt_all_cvda.rds")
+tt_all_gct  <- readRDS("~/Documents/BCB330/output/5_pheno/tt_all_gct.rds")
+tt_all_mct  <- readRDS("~/Documents/BCB330/output/5_pheno/tt_all_mct.rds")
+
+```
+
+```{r}
+
+### Global Set-up for GSEA with GO:BP
+gene_df_orig <- bitr(
+  tt_all_caa$basic$hugo,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+mapped <- gene_df_orig$SYMBOL
+original <- names(tt_all_caa$basic$gene)
+unmapped <- setdiff(original, mapped)
+# Recover some alias gene failed to map genes
+alias <- bitr( 
+  unmapped,
+  fromType = "ALIAS",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+# library(HGNChelper)
+# fixed <- HGNChelper::checkGeneSymbols(unmapped)
+# updated <- fixed %>% filter(Approved == TRUE & !is.na(Suggested.Symbol))
+# rescued_map <- bitr(
+#   updated$Suggested.Symbol,
+#   fromType = "SYMBOL",
+#   toType = "ENTREZID",
+#   OrgDb = org.Hs.eg.db
+# )
+
+gene_df <- bind_rows(
+  gene_df_orig,
+  alias,
+  # rescued_map
+  ) %>% distinct(SYMBOL, .keep_all = TRUE) # remove all the duplicates
+
+# Extract GO annotations from org.Hs.eg.db with corresponding entrezID
+go_bp <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = keys(org.Hs.eg.db, keytype = "ENTREZID"),
+  columns = c("GO", "ONTOLOGY"),
+  keytype = "ENTREZID"
+) %>%
+  dplyr::filter(ONTOLOGY == "BP") %>%
+  dplyr::select(term = GO, gene = ENTREZID) %>%
+  dplyr::distinct()
+
+# Convert GOID to term name used in plots
+# table contain GOID, pathway name , and ontology categories, use to convert GOID
+bp_terms <- AnnotationDbi::select(
+  GO.db,
+  keys = keys(GO.db, keytype = "GOID"),
+  columns = c("GOID", "TERM", "ONTOLOGY"),
+  keytype = "GOID"
+) |> dplyr::filter(ONTOLOGY == "BP")
+# bp_terms
+
+# helper: Rebuild geneList with ENTREZ IDs: convert gene symbol to entrezID
+build_EntrezList <- function(tstat) {
+  el <- tstat[gene_df$SYMBOL]
+  names(el) <- gene_df$ENTREZID
+  el <- sort(el, decreasing = TRUE)
+  return (el)
+}
+
+### GSEA main function that uses GO:BP: Preprocss the tstat ranking first and then apply GSEA
+run_GOBP_gsea_for_pheno <- function(tt_all,
+                                    pheno_label,
+                                    contrast_prefix,
+                                    contrasts,
+                                    go_bp,
+                                    bp_terms,
+                                    outdir = "output/GSEA") {
+  
+  pheno_dir <- file.path(outdir, pheno_label)
+  dir.create(pheno_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  models <- names(tt_all)  # basic, lifestyle, AD, path
+  
+  # 1. Build t-stat lists per model and contrast
+  tstat_list <- list()
+  
+  for (m in models) {
+    df <- tt_all[[m]]
+    if (is.null(df)) next
+    
+    # clean gene symbols
+    df <- df[!is.na(df$hugo) & df$hugo != "", ]
+    df <- df[!duplicated(df$hugo), ]
+    
+    # t-stat columns for this phenotype
+    tstat_cols <- grep(paste0("^t_", contrast_prefix), colnames(df), value = TRUE)
+    
+    tstat_list[[m]] <- list()
+    
+    for (tcol in tstat_cols) {
+      contrast_name <- sub("^t_", "", tcol)
+      
+      vec <- df[[tcol]]
+      names(vec) <- df$hugo
+      vec <- sort(vec, decreasing = TRUE)
+      
+      tstat_list[[m]][[contrast_name]] <- vec
+    }
+  }
+  
+  # 2. Build Entrez gene lists
+  geneList_entrez <- list()
+  
+  for (m in models) {
+    geneList_entrez[[m]] <- list()
+    
+    for (ct in contrasts) {
+      tstat_vec <- tstat_list[[m]][[ct]]
+      if (is.null(tstat_vec)) {
+        geneList_entrez[[m]][[ct]] <- NULL
+      } else {
+        geneList_entrez[[m]][[ct]] <- build_EntrezList(tstat_vec)
+      }
+    }
+  }
+  
+  # 3. Run GSEA BP
+  GOBP_result <- list()
+  
+  for (m in models) {
+    GOBP_result[[m]] <- list()
+    
+    for (ct in contrasts) {
+      message("Running GSEA BP: ", pheno_label, " | model: ", m, " | contrast: ", ct)
+      
+      gl <- geneList_entrez[[m]][[ct]]
+      if (is.null(gl) || length(gl) == 0) {
+        message("geneList is empty")
+        GOBP_result[[m]][[ct]] <- NULL
+        next
+      }
+      
+      res <- GSEA(
+        geneList     = gl,
+        TERM2GENE    = go_bp,
+        minGSSize    = 15,
+        maxGSSize    = 500,
+        pvalueCutoff = 1,
+        verbose      = FALSE
+      )
+      
+      idx <- match(res@result$ID, bp_terms$GOID)
+      res@result$Description <- bp_terms$TERM[idx]
+      
+      GOBP_result[[m]][[ct]] <- res
+    }
+  }
+  
+  # Save the full list 
+  saveRDS(
+    GOBP_result,
+    file = file.path(pheno_dir, paste0("GOBP_", pheno_label, "_all_models.rds"))
+  )
+  
+  return(GOBP_result)
+}
+
+
+GOBP_caa <- run_GOBP_gsea_for_pheno(
+  tt_all          = tt_all_caa,
+  pheno_label     = "caa",
+  contrast_prefix = "caa_4gp",
+  contrasts       = c("caa_4gp1", "caa_4gp2", "caa_4gp3"),
+  go_bp           = go_bp,
+  bp_terms        = bp_terms
+)
+GOBP_art <- run_GOBP_gsea_for_pheno(
+  tt_all          = tt_all_art,
+  pheno_label     = "art",
+  contrast_prefix = "arteriol_scler",
+  contrasts       = c("arteriol_scler1", "arteriol_scler2", "arteriol_scler3"),
+  go_bp           = go_bp,
+  bp_terms        = bp_terms
+)
+GOBP_cvda <- run_GOBP_gsea_for_pheno(
+  tt_all          = tt_all_cvda,
+  pheno_label     = "cvda",
+  contrast_prefix = "cvda_4gp2",
+  contrasts       = c("cvda_4gp21", "cvda_4gp22", "cvda_4gp23"),
+  go_bp           = go_bp,
+  bp_terms        = bp_terms
+)
+GOBP_gct <- run_GOBP_gsea_for_pheno(
+  tt_all          = tt_all_gct,
+  pheno_label     = "gct",
+  contrast_prefix = "ci_num2_gct",
+  contrasts       = "ci_num2_gct1",
+  go_bp           = go_bp,
+  bp_terms        = bp_terms
+)
+GOBP_mct <- run_GOBP_gsea_for_pheno(
+  tt_all          = tt_all_mct,
+  pheno_label     = "mct",
+  contrast_prefix = "ci_num2_mct",
+  contrasts       = "ci_num2_mct1",
+  go_bp           = go_bp,
+  bp_terms        = bp_terms
+)
+
+```
+
+```{r}
+### Load GOBP
+GOBP_caa  <- readRDS("output/GSEA/caa/GOBP_caa_all_models.rds")
+GOBP_art  <- readRDS("output/GSEA/art/GOBP_art_all_models.rds")
+GOBP_cvda <- readRDS("output/GSEA/cvda/GOBP_cvda_all_models.rds")
+GOBP_gct  <- readRDS("output/GSEA/gct/GOBP_gct_all_models.rds")
+GOBP_mct  <- readRDS("output/GSEA/mct/GOBP_mct_all_models.rds")
+
+```
+
+```{r}
+## -----------------------------------------------------------------------------
+## SECTION 3.6.4: Result Summary 
+## -----------------------------------------------------------------------------
+
+# helper
+extract_paths <- function(obj, fdr = 0.5) {
+  df <- obj@result
+  df <- df[df$p.adjust < fdr, ]
+
+  up <- df$Description[df$NES > 0]
+  down <- df$Description[df$NES < 0]
+
+  # collapse into single strings
+  up_str <- if (length(up) == 0) "" else paste(up, collapse = ", ")
+  down_str <- if (length(down) == 0) "" else paste(down, collapse = ", ")
+
+  list(up = up_str, down = down_str)
+}
+
+run_GOBP_summary_05 <- function(GOBP_result,
+                                pheno_label,
+                                contrasts,
+                                outdir = "output/gsea_summary") {
+  
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Initialize vectors
+  contrast_vec  <- character()
+  model_vec     <- character()
+  up_vec        <- character()
+  down_vec      <- character()
+  up_count_vec  <- numeric()
+  down_count_vec <- numeric()
+  
+  models <- names(GOBP_result)   # basic, lifestyle, AD, path
+  
+  for (m in models) {
+    for (ct in contrasts) {
+      
+      res <- GOBP_result[[m]][[ct]]
+      
+      paths <- extract_paths(res, fdr = 0.05)
+      
+      # store up/down strings
+      up_vec   <- c(up_vec,   paths$up)
+      down_vec <- c(down_vec, paths$down)
+      
+      # store counts
+      up_count_vec <- c(
+        up_count_vec,
+        if (paths$up == "") 0 else length(strsplit(paths$up, ", ")[[1]])
+      )
+      down_count_vec <- c(
+        down_count_vec,
+        if (paths$down == "") 0 else length(strsplit(paths$down, ", ")[[1]])
+      )
+      
+      contrast_vec <- c(contrast_vec, ct)
+      model_vec    <- c(model_vec, m)
+    }
+  }
+  
+  # Build summary tables 
+  summary_table <- data.frame(
+    phenotype     = pheno_label,
+    fdr_threshold = "0.05",
+    contrast      = contrast_vec,
+    model         = model_vec,
+    up            = up_vec,
+    down          = down_vec,
+    stringsAsFactors = FALSE
+  )
+  
+  summary_count <- data.frame(
+    phenotype     = pheno_label,
+    fdr_threshold = "0.05",
+    contrast      = contrast_vec,
+    model         = model_vec,
+    up            = up_count_vec,
+    down          = down_count_vec,
+    stringsAsFactors = FALSE
+  )
+  
+  # Save results
+  write.csv(
+  summary_table,
+  file.path(outdir, paste0("GOBP_", pheno_label, "_summary_table_05.csv")),
+  row.names = FALSE
+)
+
+write.csv(
+  summary_count,
+  file.path(outdir, paste0("GOBP_", pheno_label, "_summary_count_05.csv")),
+  row.names = FALSE
+)
+
+  # saveRDS(summary_table,
+  #         file.path(outdir, paste0("GOBP_", pheno_label, "_summary_table_05.rds")))
+  # 
+  # saveRDS(summary_count,
+  #         file.path(outdir, paste0("GOBP_", pheno_label, "_summary_count_05.rds")))
+  
+  # Return both tables
+  return(list(
+    table_05 = summary_table,
+    count_05 = summary_count
+  ))
+}
+
+caa_GOBP_summary <- run_GOBP_summary_05(GOBP_caa, "caa", c("caa_4gp1", "caa_4gp2", "caa_4gp3"))
+art_GOBP_summary <- run_GOBP_summary_05(
+  GOBP_art, "art", c("arteriol_scler1", "arteriol_scler2", "arteriol_scler3")
+)
+cvda_GOBP_summary <- run_GOBP_summary_05(
+  GOBP_cvda, "cvda", c("cvda_4gp21", "cvda_4gp22", "cvda_4gp23")
+)
+gct_GOBP_summary <- run_GOBP_summary_05(
+  GOBP_gct, "gct", "ci_num2_gct1"
+)
+mct_GOBP_summary <- run_GOBP_summary_05(
+  GOBP_mct, "mct", "ci_num2_mct1"
+)
+```
+
+
+```{r}
+## -----------------------------------------------------------------------------
+## SECTION 3.6.6 RRVGO
+## -----------------------------------------------------------------------------
+### RRVGO: reduce dimention of GSEA object for non-pair-wise contrarst
+
+run_rrvgo <- function(gsea_obj,
+                      pheno_label,
+                      model_label,
+                      contrast_label,
+                      ontology = "BP",
+                      threshold = 0.7,
+                      outdir = "output/rrvgo") {
+  
+  # Create output directory
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  pheno_dir <- file.path(outdir, pheno_label)
+  dir.create(pheno_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Extract GSEA result table
+  res <- gsea_obj@result
+  
+  # Filter significant pathways
+  res <- res[res$p.adjust < 0.05, ]
+  
+  if (nrow(res) == 0) {
+    message("No significant GO terms — skipping RRVGO.")
+    return(NULL)
+  }
+  
+  # Prepare terms and scores
+  terms <- res$ID
+  scores <- abs(res$NES)
+  names(scores) <- terms
+  
+  # Compute similarity matrix
+  simMatrix <- calculateSimMatrix(
+    terms,
+    orgdb = "org.Hs.eg.db",
+    ont = ontology,
+    method = "Rel"
+  )
+  
+  # Remove GO terms with NA similarity
+  valid_terms <- rownames(simMatrix)[rowSums(is.na(simMatrix)) < ncol(simMatrix)]
+  simMatrix <- simMatrix[valid_terms, valid_terms, drop = FALSE]
+  scores <- scores[valid_terms]
+  
+  # Save simMatrix for downstream analysis
+  sim_file <- file.path(
+    pheno_dir,
+    paste0("RRVGO_", pheno_label, "_", model_label, "_", contrast_label, "_simMatrix.rds")
+  )
+  saveRDS(simMatrix, sim_file)
+  
+  # If fewer than 3 valid terms remain, skip RRVGO
+  if (length(valid_terms) < 3) {
+    message("Fewer than 3 valid GO terms after similarity filtering — skipping reduction.")
+    
+    # Save minimal reducedTerms
+    reducedTerms <- data.frame(
+      parent = valid_terms,
+      term = valid_terms,
+      score = scores,
+      stringsAsFactors = FALSE
+    )
+    
+    reduced_file <- file.path(
+      pheno_dir,
+      paste0("RRVGO_", pheno_label, "_", model_label, "_", contrast_label, "_reducedTerms.rds")
+    )
+    saveRDS(reducedTerms, reduced_file)
+    
+    return(list(
+      simMatrix = sim_file,
+      reducedTerms = reduced_file,
+      heatmap = NULL,
+      scatter = NULL
+    ))
+  }
+  
+  # Full RRVGO reduction
+  reducedTerms <- reduceSimMatrix(
+    simMatrix,
+    scores,
+    threshold = threshold,
+    orgdb = "org.Hs.eg.db"
+  )
+  
+  # Save reducedTerms
+  reduced_file <- file.path(
+    pheno_dir,
+    paste0("RRVGO_", pheno_label, "_", model_label, "_", contrast_label, "_reducedTerms.rds")
+  )
+  saveRDS(reducedTerms, reduced_file)
+  
+  # Output filenames
+  heatmap_file <- file.path(
+    pheno_dir,
+    paste0("RRVGO_", pheno_label, "_", model_label, "_", contrast_label, "_heatmap.png")
+  )
+  scatter_file <- file.path(
+    pheno_dir,
+    paste0("RRVGO_", pheno_label, "_", model_label, "_", contrast_label, "_scatter.png")
+  )
+  
+  # Heatmap
+  png(heatmap_file, width = 1600, height = 1200)
+  invisible(heatmapPlot(simMatrix, reducedTerms, annotateParent=TRUE,
+                        annotationLabel="parentTerm", fontsize=12))
+  dev.off()
+  
+  # Scatter
+  png(scatter_file, width = 1600, height = 1200)
+  invisible(print(scatterPlot(simMatrix, reducedTerms, labelSize = 8)))
+  dev.off()
+  
+  return(list(
+    simMatrix = sim_file,
+    reducedTerms = reduced_file
+  ))
+}
+
+run_rrvgo(GOBP_caa$basic[["caa_4gp1"]], "caa", "basic", "caa_4gp1")
+run_rrvgo(GOBP_caa$basic[["caa_4gp2"]], "caa", "basic", "caa_4gp2")
+run_rrvgo(GOBP_caa$basic[["caa_4gp3"]], "caa", "basic", "caa_4gp3")
+
+run_rrvgo(GOBP_caa$lifestyle[["caa_4gp1"]], "caa", "lifestyle", "caa_4gp1")
+run_rrvgo(GOBP_caa$lifestyle[["caa_4gp2"]], "caa", "lifestyle", "caa_4gp2")
+run_rrvgo(GOBP_caa$lifestyle[["caa_4gp3"]], "caa", "lifestyle", "caa_4gp3")
+
+run_rrvgo(GOBP_caa$AD[["caa_4gp1"]], "caa", "AD", "caa_4gp1")
+run_rrvgo(GOBP_caa$AD[["caa_4gp2"]], "caa", "AD", "caa_4gp2")
+run_rrvgo(GOBP_caa$AD[["caa_4gp3"]], "caa", "AD", "caa_4gp3")
+
+run_rrvgo(GOBP_caa$path[["caa_4gp1"]], "caa", "path", "caa_4gp1")
+run_rrvgo(GOBP_caa$path[["caa_4gp2"]], "caa", "path", "caa_4gp2")
+run_rrvgo(GOBP_caa$path[["caa_4gp3"]], "caa", "path", "caa_4gp3")
+
+run_rrvgo(GOBP_art$basic[["arteriol_scler1"]], "art", "basic", "arteriol_scler1")
+run_rrvgo(GOBP_art$basic[["arteriol_scler2"]], "art", "basic", "arteriol_scler2")
+run_rrvgo(GOBP_art$basic[["arteriol_scler3"]], "art", "basic", "arteriol_scler3")
+
+run_rrvgo(GOBP_art$lifestyle[["arteriol_scler1"]], "art", "lifestyle", "arteriol_scler1")
+run_rrvgo(GOBP_art$lifestyle[["arteriol_scler2"]], "art", "lifestyle", "arteriol_scler2")
+run_rrvgo(GOBP_art$lifestyle[["arteriol_scler3"]], "art", "lifestyle", "arteriol_scler3")
+
+run_rrvgo(GOBP_art$AD[["arteriol_scler1"]], "art", "AD", "arteriol_scler1")
+run_rrvgo(GOBP_art$AD[["arteriol_scler2"]], "art", "AD", "arteriol_scler2")
+run_rrvgo(GOBP_art$AD[["arteriol_scler3"]], "art", "AD", "arteriol_scler3")
+
+run_rrvgo(GOBP_art$path[["arteriol_scler1"]], "art", "path", "arteriol_scler1")
+run_rrvgo(GOBP_art$path[["arteriol_scler2"]], "art", "path", "arteriol_scler2")
+run_rrvgo(GOBP_art$path[["arteriol_scler3"]], "art", "path", "arteriol_scler3")
+
+run_rrvgo(GOBP_cvda$basic[["cvda_4gp21"]], "cvda", "basic", "cvda_4gp21")
+run_rrvgo(GOBP_cvda$basic[["cvda_4gp22"]], "cvda", "basic", "cvda_4gp22")
+run_rrvgo(GOBP_cvda$basic[["cvda_4gp23"]], "cvda", "basic", "cvda_4gp23")
+
+run_rrvgo(GOBP_cvda$lifestyle[["cvda_4gp21"]], "cvda", "lifestyle", "cvda_4gp21")
+run_rrvgo(GOBP_cvda$lifestyle[["cvda_4gp22"]], "cvda", "lifestyle", "cvda_4gp22")
+run_rrvgo(GOBP_cvda$lifestyle[["cvda_4gp23"]], "cvda", "lifestyle", "cvda_4gp23")
+
+run_rrvgo(GOBP_cvda$AD[["cvda_4gp21"]], "cvda", "AD", "cvda_4gp21")
+run_rrvgo(GOBP_cvda$AD[["cvda_4gp22"]], "cvda", "AD", "cvda_4gp22")
+run_rrvgo(GOBP_cvda$AD[["cvda_4gp23"]], "cvda", "AD", "cvda_4gp23")
+
+run_rrvgo(GOBP_cvda$path[["cvda_4gp21"]], "cvda", "path", "cvda_4gp21")
+run_rrvgo(GOBP_cvda$path[["cvda_4gp22"]], "cvda", "path", "cvda_4gp22")
+run_rrvgo(GOBP_cvda$path[["cvda_4gp23"]], "cvda", "path", "cvda_4gp23")
+
+run_rrvgo(GOBP_mct$basic[["ci_num2_mct1"]], "mct", "basic", "ci_num2_mct1")
+run_rrvgo(GOBP_mct$lifestyle[["ci_num2_mct1"]], "mct", "lifestyle", "ci_num2_mct1")
+run_rrvgo(GOBP_mct$AD[["ci_num2_mct1"]], "mct", "AD", "ci_num2_mct1")
+run_rrvgo(GOBP_mct$path[["ci_num2_mct1"]], "mct", "path", "ci_num2_mct1")
+
+run_rrvgo(GOBP_gct$basic[["ci_num2_gct1"]], "gct", "basic", "ci_num2_gct1")
+run_rrvgo(GOBP_gct$lifestyle[["ci_num2_gct1"]], "gct", "lifestyle", "ci_num2_gct1")
+run_rrvgo(GOBP_gct$AD[["ci_num2_gct1"]], "gct", "AD", "ci_num2_gct1")
+run_rrvgo(GOBP_gct$path[["ci_num2_gct1"]], "gct", "path", "ci_num2_gct1")
+
+```
+
+
+```{r}
+## -----------------------------------------------------------------------------
+## SECTION 3.6.5 Visualization of RRVGO Patwhays
+## -----------------------------------------------------------------------------
+
+### Visualize the top three parent term gsea plot (ranked by NES)
+
+# helper
+compute_rrvgo <- function(gsea_obj, ontology = "BP", threshold = 0.7) {
+  
+  res <- gsea_obj@result
+  res <- res[res$p.adjust < 0.05, ]
+  if (nrow(res) < 3) {
+  message("Skipping RRVGO: fewer than 3 GO terms")
+  return(NULL)
+}
+  
+  terms <- res$ID
+  scores <- abs(res$NES)
+  names(scores) <- terms
+  
+  simMatrix <- calculateSimMatrix(
+    terms,
+    orgdb = "org.Hs.eg.db",
+    ont = ontology,
+    method = "Rel"
+  )
+  
+  reducedTerms <- reduceSimMatrix(
+    simMatrix,
+    scores,
+    threshold = threshold,
+    orgdb = "org.Hs.eg.db"
+  )
+  
+  reducedTerms
+}
+
+get_top3_terms <- function(reducedTerms) {
+  reducedTerms |>
+    dplyr::distinct(parent, .keep_all = TRUE) |>
+    dplyr::arrange(desc(score)) |>
+    dplyr::slice_head(n = 3) |>
+    dplyr::pull(parent)
+}
+
+run_gseaplot2_all <- function(GOBP_list, pheno_label) {
+  
+  models <- names(GOBP_list)
+  results_list <- list()
+  
+  for (model_label in models) {
+    
+    contrasts <- names(GOBP_list[[model_label]])
+    
+    for (contrast_label in contrasts) {
+      
+      message("Processing: ", pheno_label, " / ", model_label, " / ", contrast_label)
+      
+      gobj <- GOBP_list[[model_label]][[contrast_label]]
+      if (is.null(gobj)) next
+      
+      # Compute RRVGO reduction on the fly
+      reducedTerms <- compute_rrvgo(gobj)
+      if (is.null(reducedTerms)) next
+      
+      # Extract top 3 parent terms
+      top_terms <- get_top3_terms(reducedTerms)
+      if (length(top_terms) == 0) next
+      
+      results_list[[length(results_list) + 1]] <- data.frame(
+        phenotype = pheno_label,
+        model = model_label,
+        contrast = contrast_label,
+        parent_term_1 = top_terms[1],
+        parent_term_2 = top_terms[2],
+        parent_term_3 = top_terms[3],
+        stringsAsFactors = FALSE
+      )
+      
+      title_txt <- paste0(
+        toupper(pheno_label), " – ",
+        model_label, " – ",
+        contrast_label
+      )
+      
+      # Output directory
+      outdir <- file.path("output/gseaplots", pheno_label)
+      dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+      
+      outfile <- file.path(
+        outdir,
+        paste0("GSEAplot_", pheno_label, "_", model_label, "_", contrast_label, ".png")
+      )
+      
+      # Create and save plot
+      p <- gseaplot2(
+        x = gobj,
+        geneSetID = top_terms,
+        title = title_txt,
+        base_size = 12
+      )
+      
+      png(outfile, width = 2000, height = 1600, res = 150)
+      print(p)
+      dev.off()
+    }
+  }
+  if (length(results_list) == 0) return(NULL)
+  do.call(rbind, results_list)
+}
+
+all_results <- list()
+
+all_results[["caa"]] <- run_gseaplot2_all(GOBP_caa, "caa")
+all_results[["art"]] <- run_gseaplot2_all(GOBP_art, "art")
+all_results[["cvda"]] <- run_gseaplot2_all(GOBP_cvda, "cvda")
+all_results[["mct"]] <- run_gseaplot2_all(GOBP_mct, "mct")
+all_results[["gct"]] <- run_gseaplot2_all(GOBP_gct, "gct")
+
+# Combine into one table
+top3_table <- do.call(rbind, all_results)
+
+top3_long <- top3_table |>
+  tidyr::pivot_longer(
+    cols = starts_with("parent_term_"),
+    names_to = "rank",
+    values_to = "GOID"
+  )
+top3_long <- top3_long |>
+  dplyr::left_join(bp_terms, by = "GOID")
+
+top3_long
+
+write.csv(
+  top3_long,
+  file = "output/top3_rrvgo_parent_terms_all_phenotypes.csv",
+  row.names = FALSE
+)
+
+```

@@ -1,0 +1,13 @@
+"phenotype","fdr_threshold","contrast","model","up","down"
+"cvda","0.05","cvda_4gp21","basic",8,48
+"cvda","0.05","cvda_4gp22","basic",4,54
+"cvda","0.05","cvda_4gp23","basic",30,10
+"cvda","0.05","cvda_4gp21","lifestyle",3,47
+"cvda","0.05","cvda_4gp22","lifestyle",2,38
+"cvda","0.05","cvda_4gp23","lifestyle",11,10
+"cvda","0.05","cvda_4gp21","AD",3,55
+"cvda","0.05","cvda_4gp22","AD",3,50
+"cvda","0.05","cvda_4gp23","AD",18,12
+"cvda","0.05","cvda_4gp21","path",3,47
+"cvda","0.05","cvda_4gp22","path",2,43
+"cvda","0.05","cvda_4gp23","path",5,7

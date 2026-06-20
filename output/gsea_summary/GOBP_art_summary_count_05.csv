@@ -1,0 +1,13 @@
+"phenotype","fdr_threshold","contrast","model","up","down"
+"art","0.05","arteriol_scler1","basic",114,1
+"art","0.05","arteriol_scler2","basic",23,6
+"art","0.05","arteriol_scler3","basic",115,29
+"art","0.05","arteriol_scler1","lifestyle",115,1
+"art","0.05","arteriol_scler2","lifestyle",7,1
+"art","0.05","arteriol_scler3","lifestyle",70,18
+"art","0.05","arteriol_scler1","AD",95,1
+"art","0.05","arteriol_scler2","AD",27,5
+"art","0.05","arteriol_scler3","AD",77,16
+"art","0.05","arteriol_scler1","path",56,0
+"art","0.05","arteriol_scler2","path",35,8
+"art","0.05","arteriol_scler3","path",85,24

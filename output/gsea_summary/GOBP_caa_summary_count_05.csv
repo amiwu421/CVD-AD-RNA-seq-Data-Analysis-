@@ -1,0 +1,13 @@
+"phenotype","fdr_threshold","contrast","model","up","down"
+"caa","0.05","caa_4gp1","basic",0,0
+"caa","0.05","caa_4gp2","basic",4,16
+"caa","0.05","caa_4gp3","basic",11,23
+"caa","0.05","caa_4gp1","lifestyle",2,6
+"caa","0.05","caa_4gp2","lifestyle",8,23
+"caa","0.05","caa_4gp3","lifestyle",3,8
+"caa","0.05","caa_4gp1","AD",12,35
+"caa","0.05","caa_4gp2","AD",11,100
+"caa","0.05","caa_4gp3","AD",11,48
+"caa","0.05","caa_4gp1","path",14,37
+"caa","0.05","caa_4gp2","path",9,98
+"caa","0.05","caa_4gp3","path",12,50

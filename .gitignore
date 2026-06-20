@@ -1,0 +1,10 @@
+.DS_Store
+.RDataTmp
+.Rapp.history
+.Rproj.user/
+*.rds
+*.tsv
+*.rds
+*.tsv
+.Rhistory
+.RData
